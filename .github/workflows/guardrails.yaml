@@ -1,0 +1,116 @@
+name: Guardrails Security Scan
+
+on:
+  pull_request:
+    branches: 
+        - "master"
+        - "main"
+
+jobs:
+  scan-and-report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5.0.1
+
+      - name: Install Guardrails CLI and dependencies
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/guardrailsio/guardrails-cli/main/etc/scripts/install.sh | bash
+          sudo apt install jq -y
+
+      - name: Run Guardrails Scan
+        id: guardrails_scan
+        env:
+          GUARDRAILS_CLI_TOKEN: ${{ secrets.GUARDRAILS_TOKEN }}
+        run: |
+          set -o pipefail
+          # Export to JSON. We use || true because the CLI exits with 1 when findings exist,
+          # but we want to process the JSON file regardless.
+          guardrails scan -f json | tee scan_results.json || export SCAN_EXIT_CODE=$?
+          
+          # Check if the scan reported success or findings
+          # jq -r '.ok' checks the boolean in the JSON
+          if [ "$(jq -r '.ok' scan_results.json)" = "false" ]; then
+            echo "VULNS_FOUND=true" >> $GITHUB_ENV
+          else
+            echo "VULNS_FOUND=false" >> $GITHUB_ENV
+          fi
+
+      - name: Decorate PR Comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const data = JSON.parse(fs.readFileSync('scan_results.json', 'utf8'));
+            
+            const header = "## 🛡️ Guardrails Security Report";
+            const reportUrl = data.report;
+            const counts = data.results.count;
+            
+            // Build the Summary Table
+            let body = `${header}\n\n`;
+            body += `| Total Findings | Open | Fixed | New |\n`;
+            body += `| :--- | :--- | :--- | :--- |\n`;
+            body += `| ${counts.total} | **${counts.open}** | ${counts.fixed} | ${counts.new} |\n\n`;
+
+            if (counts.total > 0) {
+              body += `### 🔍 Finding Details\n\n`;
+              body += `| Severity | Rule | File | Line |\n`;
+              body += `| :--- | :--- | :--- | :--- |\n`;
+
+              // Iterate through rules and vulnerabilities
+              data.results.rules.forEach(ruleGroup => {
+                ruleGroup.vulnerabilities.forEach(vuln => {
+                  const severity = vuln.severity.name;
+                  const ruleTitle = vuln.engineRule.title || ruleGroup.rule.title;
+                  const path = vuln.path;
+                  const line = vuln.lineNumber;
+                  
+                  // Add row to table
+                  body += `| ${severity} | ${ruleTitle} | \`${path}\` | ${line} |\n`;
+                });
+              });
+
+              body += `\n\n❌ **Action Required:** Please review and resolve the findings above.`;
+            } else {
+              body += `✅ **No vulnerabilities found!** Your code looks clean.`;
+            }
+
+            body += `\n\n--- \n🔗 [View Full Report on Guardrails Dashboard](${reportUrl})`;
+
+            // Logic to Update or Create Comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+
+            const botComment = comments.find(c => c.body.includes(header));
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: body
+              });
+            }
+
+      - name: Fail Job if Vulnerabilities Exist
+        run: |
+          if [ "${{ env.VULNS_FOUND }}" = "true" ]; then
+            echo "Security scan failed. Review the PR comment for details."
+            exit 1
+          fi
